@@ -7,7 +7,7 @@ from tqdm import tqdm
 import numpy as np
 import random
 import argparse
-from llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
+# from llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -15,6 +15,9 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None, choices=["llama2-7b-chat-4k", "longchat-v1.5-7b-32k", "xgen-7b-8k", "internlm-7b-8k", "chatglm2-6b", "chatglm2-6b-32k", "chatglm3-6b-32k", "vicuna-v1.5-7b-16k"])
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
+    parser.add_argument('--t', action='store_true', help="Test for short")
+    parser.add_argument('--l', action='store_true', help="Test for long")
+    parser.add_argument('--m', action='store_true', help="Multi-GPUs")
     return parser.parse_args(args)
 
 # This is the customized building prompt for chat models
@@ -30,7 +33,8 @@ def build_chat(tokenizer, prompt, model_name):
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
     elif "llama2" in model_name:
-        prompt = f"[INST]{prompt}[/INST]"
+        # prompt = f"[INST]{prompt}[/INST]"
+        prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>You are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
     elif "xgen" in model_name:
         header = (
             "A chat between a curious human and an artificial intelligence assistant. "
@@ -48,9 +52,11 @@ def post_process(response, model_name):
         response = response.split("<eoa>")[0]
     return response
 
-def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset, device, model_name, model2path, out_path):
+def get_pred(args, rank, world_size, data, max_length, max_gen, prompt_format, dataset, device, model_name, model2path, out_path):
+    print('\nTesting in: ',dataset)
+    print('\nRunning in: ',f'cuda:{rank}')
     device = torch.device(f'cuda:{rank}')
-    model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device)
+    model, tokenizer = load_model_and_tokenizer(args, model2path[model_name], model_name, device)
     for json_obj in tqdm(data):
         prompt = prompt_format.format(**json_obj)
         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
@@ -80,6 +86,17 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
                 min_length=context_length+1,
                 eos_token_id=[tokenizer.eos_token_id, tokenizer.encode("\n", add_special_tokens=False)[-1]],
             )[0]
+        elif 'llama' in model_name:
+            output = model.generate(
+                **input,
+                max_new_tokens=max_gen,
+                num_beams=1,
+                do_sample=False,
+                bos_token_id=128000,
+                pad_token_id=128001,
+                eos_token_id=[128001,128008,128009],
+                temperature=1.0,
+            )[0]
         else:
             output = model.generate(
                 **input,
@@ -104,17 +121,32 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
-def load_model_and_tokenizer(path, model_name, device):
+def load_model_and_tokenizer(args, path, model_name, device):
     if "chatglm" in model_name or "internlm" in model_name or "xgen" in model_name:
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device)
     elif "llama2" in model_name:
-        replace_llama_attn_with_flash_attn()
-        tokenizer = LlamaTokenizer.from_pretrained(path)
-        model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16).to(device)
+        # replace_llama_attn_with_flash_attn()
+        # tokenizer = LlamaTokenizer.from_pretrained(path)
+        # model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16).to(device)
+        
+        tokenizer = AutoTokenizer.from_pretrained(path)
+        if args.m:
+            model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16,
+                                                        #  attn_implementation="flash_attention_2",
+                                                         device_map='auto',
+                                                         )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(path, 
+                                                        torch_dtype=torch.bfloat16,
+                                                        # attn_implementation="flash_attention_2",
+                                                        ).to(device)
+        
+
+
     elif "longchat" in model_name or "vicuna" in model_name:
         from fastchat.model import load_model
-        replace_llama_attn_with_flash_attn()
+        # replace_llama_attn_with_flash_attn()
         model, _ = load_model(
             path,
             device='cpu',
@@ -127,12 +159,15 @@ def load_model_and_tokenizer(path, model_name, device):
         model = model.bfloat16()
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
     model = model.eval()
+    # model = model.train()
     return model, tokenizer
 
 if __name__ == '__main__':
     seed_everything(42)
     args = parse_args()
     world_size = torch.cuda.device_count()
+    if args.m:
+        world_size = 1
     mp.set_start_method('spawn', force=True)
 
     model2path = json.load(open("config/model2path.json", "r"))
@@ -144,6 +179,13 @@ if __name__ == '__main__':
     if args.e:
         datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", \
             "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+    elif args.t:
+        datasets = ["multifieldqa_zh", "multi_news"]
+        # datasets = ["multi_news","multifieldqa_zh"]
+        # datasets = ["multi_news"]
+        # datasets = ["multifieldqa_zh"]
+    elif args.l:
+        datasets = ["narrativeqa", "vcsum"]
     else:
         datasets = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
                     "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \
@@ -156,14 +198,17 @@ if __name__ == '__main__':
         os.makedirs("pred")
     if not os.path.exists("pred_e"):
         os.makedirs("pred_e")
+    print(f'\n\nSub-Sets:\n',datasets)
     for dataset in datasets:
         if args.e:
-            data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test')
+            # data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test')
+            data = load_dataset('/new_data/yanghq/datasets/THUDM/LongBench', f"{dataset}_e", split='test')
             if not os.path.exists(f"pred_e/{model_name}"):
                 os.makedirs(f"pred_e/{model_name}")
             out_path = f"pred_e/{model_name}/{dataset}.jsonl"
         else:
-            data = load_dataset('THUDM/LongBench', dataset, split='test')
+            # data = load_dataset('THUDM/LongBench', dataset, split='test')
+            data = load_dataset('/new_data/yanghq/datasets/THUDM/LongBench', dataset, split='test')
             if not os.path.exists(f"pred/{model_name}"):
                 os.makedirs(f"pred/{model_name}")
             out_path = f"pred/{model_name}/{dataset}.jsonl"
@@ -173,7 +218,7 @@ if __name__ == '__main__':
         data_subsets = [data_all[i::world_size] for i in range(world_size)]
         processes = []
         for rank in range(world_size):
-            p = mp.Process(target=get_pred, args=(rank, world_size, data_subsets[rank], max_length, \
+            p = mp.Process(target=get_pred, args=(args, rank, world_size, data_subsets[rank], max_length, \
                         max_gen, prompt_format, dataset, device, model_name, model2path, out_path))
             p.start()
             processes.append(p)
